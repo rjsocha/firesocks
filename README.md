@@ -1,3 +1,5 @@
+[![asciicast](https://asciinema.org/a/300286.png =500x333)](https://asciinema.org/a/300286)
+
 You can put Digital API access token in env var:
 
 ```
