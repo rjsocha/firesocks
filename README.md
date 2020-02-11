@@ -1,4 +1,33 @@
-[![asciicast](https://asciinema.org/a/300286.png =500x333)](https://asciinema.org/a/300286)
+# Firesocks - Pi-Hole ad-blocker via WireGuard.
+
+This is unpaid job from one of the freelancer-like sites. This about 18 hours of work. I don't know if this too much for such project.
+
+Requiremets of the customer:
+1. All should work from console/terminal.
+2. Output should be in colors.
+3. Should be self containted (git clone & and run ./firesocks ...)
+3. Should work from Linux/MacOS X/Windows (should detect OS).
+4. Generate ed25519 ssh "session" key.
+5. Create droplet on Digital Ocean (API token provided by user).
+6. Configure provider firewall.
+7. Configure host firewall.
+8. Bootstrap sever (update&upgrade, install wireguard, docker, docker-compose etc).
+9. Create WireGaurd VPN endpoint and deploy Pi-Hole via docker (docker-compose).
+10. Add unbound as resolver for Pi-Hole.
+11. Install wireguard on client host.
+12. Connect to VPN and expose pi-hole admin panel and redriect all DNS queries via VPN to Pi-Hole instance.
+13. Create additional users.
+14. Generate qrcode for mobile devices (with Wireguard configuration).
+
+Not finised requirements:
+1. Display web page when domain is blocked.
+2. Windows part (only stub functionality was writen).
+3. Monitor VPN connection and terminate it after specified time.
+
+Tech used: Linux, MacOS X, WireGuard, docker, docker-compose, terraform, ssh, pi-hole,unbound, qrterminal, Windows, powershell.
+
+Demo of functionality.
+[<img src="https://asciinema.org/a/300286.png" width=500 height=333>](https://asciinema.org/a/300286)
 
 You can put Digital API access token in env var:
 
