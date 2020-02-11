@@ -1,0 +1,350 @@
+#!/bin/bash
+
+# by Robert Socha 
+# Simple WireGuard configuration manager
+# quick&dirty
+# This is more PoC than full-blown tool :)
+
+# Options
+# add - add new client configuration / peer
+# del - remove client configuration / peer
+# show - show client configuration
+# list - list users
+# ip set - create ip pool
+# setup  - create simple server configuration
+
+umask 077
+
+fatal_error() {
+local _rc=$1
+  shift
+  printf "$@\n"
+  exit $_rc
+}
+
+command_exists() {
+  command -v $1 &>/dev/null || fatal_error 10 "missing $1 command... aborting"
+}
+
+# IPv4 only :)
+function _is_ip {
+  regex="^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$"
+  [ $# -eq 1 ] && {
+    [[ "$1" =~ $regex ]] && return 0
+  }
+  return 1
+}
+
+function _is_ip_cidr {
+  regex="^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])/(3[012]|[12]?[0-9])$"
+  [ $# -eq 1 ] && {
+    [[ "$1" =~ $regex ]] && return 0
+  }
+  return 1
+}
+
+function _ip_from_cidr {
+  if _is_ip_cidr $1
+  then
+    echo "${1%%/*}"
+  fi
+}
+
+function _cidr_from_cidr {
+  if _is_ip_cidr $1
+  then
+    echo "${1##*/}"
+  fi
+}
+
+function _ip2long {
+  if _is_ip $1
+  then
+    local ip=$1;local o1;local o2;local o3;local o4
+    IFS="." read o1 o2 o3 o4 <<< "$ip"
+    echo -n $(( ($o1 << 24) + ($o2 << 16) + ($o3 << 8) + $o4))
+  fi
+}
+
+function _long2ip {
+  if [[ $1 =~ ^[0-9]+$ ]]
+  then
+    echo -n "$((($1 >> 24)&255)).$((($1 >> 16)&255)).$((($1 >> 8)&255)).$(($1 &255))"
+  fi
+}
+
+function _cidr2long {
+  if [[ -n $1 && $1 =~ ^[0-9]+$ ]] && [[ $1 -ge 0 && $1 -le 32 ]]
+  then
+    echo  -n $((~((1<<(32-$1))-1)&0xffffffff))
+  fi
+}
+
+command_exists wg
+command_exists wg-quick
+
+CONFIG="$HOME/.config/wg_simple"
+
+[[ -d $CONFIG ]] || mkdir -p "$CONFIG"
+
+opt=$1
+
+function show_ip_pool() {
+  [[ -f $CONFIG/ip/current ]] && [[ -f $CONFIG/ip/pool ]] || fatal_error 20 "Missing IP pool configuration!"
+  pool=$(<"$CONFIG/ip/pool") 
+  current=$(<"$CONFIG/ip/current")
+  echo "Pool: $pool"
+  echo "Next free: $(_long2ip $(( $(_ip2long $(_ip_from_cidr $pool)) + $current)))"
+}
+
+function set_ip_pool() {
+  [[ -f $CONFIG/ip/pool ]] && fatal_error 50 "IP pool is already set!"
+  if _is_ip_cidr $1 
+  then
+      ip=$(_ip_from_cidr $1)
+      prf=$(_cidr_from_cidr $1)
+      netmask=$(_cidr2long $prf)
+      ip_addr=$(_ip2long $ip)
+      [[ $prf -ge 25 ]] && fatal_error 50 "Subnet too small!"
+      # check if we are on subnet boundary
+      [[ $(( $ip_addr & $netmask )) -ne $ip_addr ]] && fatal_error 50 "Incorrect subnet prefix!"
+      # Last IP in the pool
+      last=$(( ~$netmask & 0xffffffff)) 
+      # .1 is for server
+      current=2
+      [[ -d $CONFIG/ip ]] || mkdir -p "$CONFIG/ip" 
+      echo -n $1 >$CONFIG/ip/pool
+      echo -n $current >$CONFIG/ip/current
+  else
+    fatal_error 25 "SUBNET/PREFIX required!"
+  fi
+}
+
+function set_dns() {
+  if _is_ip $1
+  then
+      [[ -d $CONFIG/ip ]] || mkdir -p "$CONFIG/ip" 
+      echo -n $1 >$CONFIG/ip/dns
+  fi
+}
+
+# No locking :)
+function allocIP() {
+  [[ -f $CONFIG/ip/current ]] && [[ -f $CONFIG/ip/pool ]] || fatal_error 20 "Missing IP pool configuration!"
+  pool=$(<"$CONFIG/ip/pool") 
+  current=$(<"$CONFIG/ip/current")
+  ip=$(_ip_from_cidr $pool)
+  prf=$(_cidr_from_cidr $pool)
+  netmask=$(_cidr2long $prf)
+  ip_addr=$(_ip2long $ip)
+  last=$(( ~$netmask & 0xffffffff)) 
+  if [[ $current -lt $last ]]
+  then
+    alloc=$(_long2ip $(($ip_addr + $current)))
+    ((current++))
+    echo -n $current >$CONFIG/ip/current
+    echo "$alloc"
+    return 0
+  else
+    return 1
+  fi
+}
+
+function serverIP() {
+  [[ -f $CONFIG/ip/current ]] && [[ -f $CONFIG/ip/pool ]] || fatal_error 20 "Missing IP pool configuration!"
+  pool=$(<"$CONFIG/ip/pool") 
+  current=$(<"$CONFIG/ip/current")
+  ip=$(_ip_from_cidr $pool)
+  prf=$(_cidr_from_cidr $pool)
+  ip_addr=$(_ip2long $ip)
+  echo "$(_long2ip $(($ip_addr + 1)))/$prf"
+}
+  
+  
+function generate_server_config() {
+  server_ip=$(serverIP)  
+  priv_key=$(<"$CONFIG/private")
+  port=$(<"$CONFIG/ip/port")
+  echo "[Interface]" >/etc/wireguard/vpn.conf
+  echo "Address = $server_ip" >>/etc/wireguard/vpn.conf
+  echo "ListenPort = $port" >>/etc/wireguard/vpn.conf
+  echo "PrivateKey = $priv_key" >>/etc/wireguard/vpn.conf
+  if [[ -d $CONFIG/user ]]
+  then
+    for usr in $(find $CONFIG/user -maxdepth 1 -mindepth 1 -type f | sort)
+    do
+      source $usr
+      usr_pub=$(wg pubkey <<<"$USER_PRIVATE")
+      echo "# $(basename $usr)" >>/etc/wireguard/vpn.conf
+      echo "[Peer]" >>/etc/wireguard/vpn.conf
+      echo "PublicKey = $usr_pub" >>/etc/wireguard/vpn.conf
+      echo "AllowedIPs = $USER_IP/32" >>/etc/wireguard/vpn.conf
+    done
+  fi
+}
+
+
+function find_new_user() {
+local _count=0
+local _prefix="automatus"
+  while [[ -f $CONFIG/user/${_prefix}${_count} ]]
+  do
+    ((_count++)) || true
+  done
+  echo -n "${_prefix}${_count}"
+}
+
+function add_usr() {
+  if [[ ! -f $HOME/.vpn.ready ]]
+  then
+    fatal_error 15 "System not configured!"
+  fi
+  name=$1
+  if [[ -z $name ]]
+  then
+    name=$(find_new_user)
+  fi
+  [[ -z $name ]] && fatal_error 15 "Missing name!"
+  [[ -f $CONFIG/user/$name ]] && fatal_error 15 "Configuration for $name already exists!"
+  [[ -f $CONFIG/private ]] || fatal_error 15 "Missing server setup!"
+  [[ -d $CONFIG/user ]] || mkdir -p "$CONFIG/user"
+  priv_key=$(wg genkey)
+  pub_key=$(wg pubkey <<<"$priv_key")
+  ip=$(allocIP) || fatal_error 15 "No free IP address!"
+  echo "USER_PRIVATE=$priv_key" >$CONFIG/user/$name
+  echo "USER_IP=$ip" >>$CONFIG/user/$name
+  generate_server_config
+  systemctl is-active --quiet wg-quick@vpn && wg syncconf vpn <(wg-quick strip vpn)
+}
+
+function del_usr() {
+  name=$1
+  [[ -z $name ]] && fatal_error 15 "Missing name!"
+  [[ -f $CONFIG/user/$name ]] || fatal_error 15 "Configuration for $name not present!"
+  [[ -f $CONFIG/private ]] || fatal_error 15 "Missing server setup!"
+  rm -f $CONFIG/user/$name
+  generate_server_config
+  wg syncconf vpn <(wg-quick strip vpn)
+}
+
+function list_usr() {
+  for usr in $(find $CONFIG/user -maxdepth 1 -mindepth 1 -type f | sort)
+  do
+      basename $usr
+  done
+}
+
+function show_usr() {
+  name=$1
+  [[ -z $name ]] && fatal_error 15 "Missing name!"
+  [[ -f $CONFIG/ip/current ]] && [[ -f $CONFIG/ip/pool ]] || fatal_error 20 "Missing IP pool configuration!"
+  [[ -f $CONFIG/user/$name ]] || fatal_error 15 "Configuration for $name not present!"
+  [[ -f $CONFIG/private ]] || fatal_error 15 "Missing server setup!"
+  pool=$(<"$CONFIG/ip/pool") 
+  ip=$(_ip_from_cidr $pool)
+  prf=$(_cidr_from_cidr $pool)
+  server_ip=$(<"$CONFIG/ip/public")  
+  srv_priv_key=$(<"$CONFIG/private")
+  server_public=$(wg pubkey <<<"$srv_priv_key")
+  server_port=$(<"$CONFIG/ip/port")
+  source $CONFIG/user/$name
+  echo "[Interface]"
+  echo "Address=$USER_IP/$prf"
+  echo "PrivateKey=$USER_PRIVATE"
+  if [[ -s $CONFIG/ip/dns ]]
+  then
+    echo "DNS=$(<$CONFIG/ip/dns)"
+  fi
+  echo "[Peer]"
+  echo "PublicKey=$server_public"
+  echo "AllowedIPs=$pool"
+  echo "Endpoint=$server_ip:$server_port"
+  echo "PersistentKeepalive=30"
+}
+
+function setup_simple_server() {
+  [[ -f $CONFIG/ip/current ]] && [[ -f $CONFIG/ip/pool ]] || fatal_error 20 "Missing IP pool configuration!"
+  [[ -f /etc/wireguard/vpn.conf ]] && fatal_error 20 "Server configuration already exists!"
+  if _is_ip $1
+  then
+    echo -n "$1" >$CONFIG/ip/public
+    shift
+    port=51820
+    [[ $1 =~ ^[0-9]+$ ]] && [[ $1 -ge 1 && $1 -lt 65500 ]] && port=$1
+    echo -n "$port" >$CONFIG/ip/port
+    priv_key=$(wg genkey)
+    pub_key=$(wg pubkey <<<"$priv_key")
+    echo -n "$priv_key" >$CONFIG/private
+    generate_server_config
+    start_server
+    touch $HOME/.vpn.ready
+  else
+    fatal_error 55 "Usage: $0 setup <PUBLIC_IP> [port=51820]"
+  fi
+}
+
+function start_server() {
+  if [[ -f /etc/wireguard/vpn.conf ]] 
+  then
+    systemctl start wg-quick@vpn
+  fi
+}
+
+function stop_server() {
+  if [[ -f /etc/wireguard/vpn.conf ]] 
+  then
+    systemctl stop wg-quick@vpn
+  fi
+}
+
+case "$1" in
+  setup)
+    shift
+    setup_simple_server "$@"
+     ;;
+  start)
+    shift
+    start_server
+    ;;
+  stop)
+    shift
+    stop_server
+    ;;
+  add)
+    shift
+    add_usr "$@"
+    ;;
+  del)
+    shift
+    del_usr "$@"
+    ;;
+  dns)
+    shift
+    set_dns "$@"
+    ;;
+  show)
+    shift
+    show_usr "$@"
+    ;;
+  list)
+    shift
+    list_usr
+    ;;
+  ip)
+    shift
+    case "$1" in
+      show)
+        show_ip_pool
+        ;;
+      set)
+        shift
+        set_ip_pool "$@"
+        ;;
+      *)
+        echo "Usage: $0 ip show|set subnet/prefix"
+    esac
+    ;;
+  *)
+    fatal_error 1 "Usage: $0 add <name>|del <name>|show <name>|ip"
+esac
+# vim: set tabstop=2 shiftwidth=2 expandtab autoindent indentexpr= nosmartindent filetype=sh :

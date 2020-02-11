@@ -1,0 +1,1630 @@
+#!/usr/bin/env bash
+ME="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+VPN_GATEWAY="100.99.0.1"
+VPN_ADDRESS_POOL="100.99.0.0/16"
+
+if [[ $_XXX_IS_REMOTE != "yes" ]]
+then
+  cd "$ME"
+else
+  REMOTE_NEEDS_UPDATE=1
+fi
+
+function abort_script() {
+  _printf "{R}{N}"
+  _printf "$@"
+  exit 1
+}
+
+# Batch friendly output colorizer
+# example: _printf "{R}RED {B}BLUE {G}GREEN {Y}YELLOW {N}NEUTRAL or noreset if at end"
+function _printf() {
+local _text
+  if [[ -z $1 ]]
+  then
+    return
+  fi
+  if [[ $COLOR == "no" ]]
+  then
+    local _RED=''
+    local _GREEN=''
+    local _YELLOW=''
+    local _BLUE=''
+    local _MAGENTA=''
+    local _CYAN=''
+    local _NEUTRAL=''
+    local _BOLD=''
+    local _UNDERLINE=''
+    local _BLINK=''
+  else
+    local _RED='\e[31m'
+    local _GREEN='\e[32m'
+    local _YELLOW='\e[33m'
+    local _BLUE='\e[34m'
+    local _MAGENTA='\e[35m'
+    local _CYAN='\e[36m'
+    local _NEUTRAL='\e[0m'
+    local _BOLD='\e[1m'
+    local _UNDERLINE='\e[4m'
+    local _BLINK='\e[5m'
+  fi
+  _text="$1"
+  shift
+  if [[ $_text =~ \{N\}$ ]]
+  then
+   _text="${_text%\{N\}}"
+  else
+   _text="${_text}{N}"
+  fi
+  _text="${_text//\{G\}/$_GREEN}"
+  _text="${_text//\{B\}/$_BLUE}"
+  _text="${_text//\{Y\}/$_YELLOW}"
+  _text="${_text//\{R\}/$_RED}"
+  _text="${_text//\{C\}/$_CYAN}"
+  _text="${_text//\{M\}/$_MAGENTA}"
+  _text="${_text//\{\*\}/$_BOLD}"
+  _text="${_text//\{\_\}/$_UNDERLINE}"
+  _text="${_text//\{\+\}/$_BLINK}"
+  _text="${_text//\{N\}/$_NEUTRAL}"
+  printf "$_text" "$@"
+}
+
+function _print_center() {
+local _r
+  [[ ${#2} -ge $1 ]] && printf "${2::$1}" || {
+    _r=$(($(($1 / 2)) - $((${#2} / 2))))
+    printf " %0.s" $(eval echo "{1..$_r}")
+    printf "%s" "$2"
+    [[ $(($1 % 2)) -eq 1 ]] || ((_r--)) || true
+    [[ $((${#2} % 2)) -eq 1 ]] || ((_r++)) || true
+    printf " %0.s" $(eval echo "{1..$_r}")
+  }
+}
+
+# $1 - len
+# $2 - first line of text
+# $3 - second line of text
+function _printbox() {
+local _bs=$(($1 - 2))
+local _line _blank
+  printf -v _line  -- "-%.0s" $(eval echo "{1..$_bs}")
+  printf -v _blank -- " %.0s" $(eval echo "{1..$_bs}")
+  _printf "{Y}+%s+\n" "$_line"
+  _printf "{Y}|%s|\n" "$_blank"
+  _printf "{Y}|{G}%s{Y}|\n" "$(_print_center $_bs "$2")"
+  [[ -z $3 ]] || _printf "{Y}|{C}%s{Y}|\n" "$(_print_center $_bs "$3")"
+  _printf "{Y}|%s|\n" "$_blank"
+  _printf "{Y}+%s+\n" "$_line"
+}
+
+function _errorbox() {
+local _bs=$(($1 - 2))
+local _line _blank
+  printf -v _line  -- "-%.0s" $(eval echo "{1..$_bs}")
+  printf -v _blank -- " %.0s" $(eval echo "{1..$_bs}")
+  _printf "{R}+%s+\n" "$_line"
+  _printf "{R}|%s|\n" "$_blank"
+  _printf "{R}|{B}{R}%s{R}|\n" "$(_print_center $_bs "$2")"
+  [[ -z $3 ]] || _printf "{R}|{B}{R}%s{R}|\n" "$(_print_center $_bs "$3")"
+  _printf "{R}|%s|\n" "$_blank"
+  _printf "{R}+%s+\n" "$_line"
+}
+
+function _smallbox() {
+local _bs=$(($1 - 2))
+local _line _blank
+  printf -v _line  -- "-%.0s" $(eval echo "{1..$_bs}")
+  printf -v _blank -- " %.0s" $(eval echo "{1..$_bs}")
+  _printf "{Y}+%s+\n" "$_line"
+  _printf "{Y}|{G}%s{Y}|\n" "$(_print_center $_bs "$2")"
+  _printf "{Y}+%s+\n" "$_line"
+}
+
+
+function check_var() {
+local be_quiet=0
+  if [[ $1 == "-q" ]]
+  then
+    shift
+    be_quiet=1
+  fi
+  if [[ -z ${!1} ]]
+  then
+   _print "{R}ERROR: missing environment variable $1\n"
+   exit 1
+  fi
+  if [[ $be_quiet -eq 0 ]]
+  then
+    _print "{Y}Checking {C}$1{N}: {G}OK\n"
+  fi
+}
+
+# Preprare file or directory to send to remote host
+# Attach local files as base64 encoded variables on the begingin of the file
+# Attach tar/gz archives as base64
+# Example usage:
+# prepareRemotePayload $0 DATA=file PASSWD=/etc/passwd DIR:SAMPLEDIR=destination-remote-dir
+# Which will attach current script with two files "file" and "/etc/passwd" as:
+# REMOTE_DATA_PAYLOAD
+# REMOTE_PASSWD_PAYLOAD
+# and folder destination-remote-dir
+function prepareRemotePayload() {
+local _base64
+  _base64="-w 0"
+  if [[ ${__OS} == "darwin" ]]
+  then
+    _base64="-b 0"
+  fi
+  head -n 1 $1
+  MAIN=$1
+  shift
+  while [[ $# -gt 0 ]]
+  do
+    plFile="${1#*=}"
+    plName="${1%=*}"
+    plName="${plName^^}"
+    if [[ $plName =~ : ]]
+    then
+      plMode="${plName%:*}"
+      if [[ "$plMode" == "DIR" ]]
+      then
+	      for _dir in ${plFile//,/ }
+        do
+          if [[ ! -d $_dir ]]
+          then
+            echo "Missing directory $_dir" >&2
+            return 2
+          fi
+        done   
+        plName="REMOTE_${plName#*:}_PAYLOAD"
+        plDir=$(tar czf - ${plFile//,/ } | base64 $_base64)
+        printf "%s=%q\n" "${plName}" "$plDir"
+      fi
+    else
+      plName="REMOTE_${plName%1=*}_PAYLOAD"
+      if [[ ! -f $plFile ]]
+      then
+        echo "Missing file *$plFile*" >&2
+        return 2
+      fi
+      printf "%s=%q\n" "${plName}" "$(base64 $_base64 $plFile)"
+    fi
+    shift
+  done
+  # Add local setup variables
+  #printf "%s=%q\n" "DOCKER_VERSION"           "$DOCKER_VERSION"
+  #printf "%s=%q\n" "COLOR" "$COLOR"
+  #[[ -z $GIT_DEPLOY_HOST ]] || printf "%s=%q\n" "GIT_DEPLOY_HOST" "$GIT_DEPLOY_HOST"
+  #[[ -z $GIT_DEPLOY_USER ]] || printf "%s=%q\n" "GIT_DEPLOY_USER" "$GIT_DEPLOY_USER"
+  #[[ -z $GIT_DEPLOY_TOKEN ]] || printf "%s=%q\n" "GIT_DEPLOY_TOKEN" "$GIT_DEPLOY_TOKEN"
+  #[[ -z $__SERIALIZED_ENVIRONMENT ]] || printf "%s=%q\n" "__SERIALIZED_ENVIRONMENT" "$__SERIALIZED_ENVIRONMENT"
+  tail -n +2 $MAIN
+}
+
+# Return full path to working remote folder
+# If REMOTE_PAYLOAD_DIR is relative use user home directory
+function getRemotePayloadDir() {
+local _home
+local _remotedir
+  if [[ -z $HOME ]]
+  then
+    _home="/root"
+  else
+    _home="$HOME"
+  fi
+  if [[ -z $REMOTE_PAYLOAD_DIR ]]
+  then
+    export REMOTE_PAYLOAD_DIR=".payload"
+  fi
+  if [[ $REMOTE_PAYLOAD_DIR =~ ^/ ]]
+  then
+    _remotedir=$REMOTE_PAYLOAD_DIR
+  else
+    _remotedir="$_home/$REMOTE_PAYLOAD_DIR"
+  fi
+  [[ ! -d $_remotedir ]] && mkdir -p $_remotedir
+  echo $_remotedir
+}
+
+# Remove tmp file
+function cleanRemoteTmpFile() {
+  [[ -n $1 ]] && [[ -f $1 ]] && rm -f $1
+  return 0
+}
+
+# Generate tmp name
+function getRemoteTmpFile() {
+local _time
+local _random
+local _tmpfile
+local _home
+local _base
+local _basedir
+  _basedir=$(getRemotePayloadDir)
+  [[ ! -d $_basedir/.tmp ]] && mkdir -m 700 $_basedir/.tmp
+  if [[ -n "$1" ]]
+  then
+    _base="${1,,}"
+  else
+    _base="tmp"
+  fi
+  _time="$(date +%s)"
+  _random="$$.$RANDOM"
+  _tmpfile="$_basedir/.tmp/$_base.$_time.$_random"
+  while [[ -f $_tmpfile ]]
+  do
+    _time="$(date +%s)"
+    _random="$$.$RANDOM"
+    _tmpfile="$_basedir/.tmp/$_base.$_time.$_random"
+  done
+  echo $_tmpfile
+}
+
+# $1 PAYLOAD NAME
+# $2 OUTPUT FILE/DIR
+# Errors should be catched by "set -e" or trap mechanism (tbd)
+function getRemotePayload() {
+  [[ $# -ne 2 ]] && return 1
+    plName="${1^^}"
+    if [[ $plName =~ : ]]
+    then
+      plMode="${plName%:*}"
+      if [[ "$plMode" == "DIR" ]]
+      then
+            plName="${plName#*:}"
+            remote="REMOTE_${plName}_PAYLOAD"
+            outDir=$2
+            if [[ ! -d $outDir ]]
+            then
+              echo "Output directory $outDir do not exists" >&2
+              return 2
+            fi
+            if [[ -n "${!remote}" ]]
+            then
+              echo "${!remote}" | base64 -d | tar xzf - -C "$outDir"
+              RC=$?
+              echo "${outDir}"
+              return $RC
+            else
+              echo "MISSING"
+            fi
+      fi
+   else
+      remote="REMOTE_${plName}_PAYLOAD"
+      outFile=$2
+      #if [[ -f $outFile ]]
+      #then
+      #  echo "Output file $outFile already exists" >&2
+      #  return 2
+      #fi
+      if [[ -n "${!remote}" ]]
+      then
+        echo "${!remote}" | base64 -d >$outFile
+        echo "$outFile"
+      else
+        echo "MISSING"
+    fi
+  fi
+}
+
+# Example usage
+#    tmp=$(getRemoteTmpFile)
+#    f1=$(getRemotePayload PAYLOAD $tmp)
+#    echo TMP: $f1
+#    cat $f1
+#    cleanRemoteTmpFile $data
+#    working=$(getRemotePayload DIR:SAMPLEDIR $(getRemotePayloadDir))
+#
+# Sending
+#   payload=$(prepareRemotePayload $0 PAYLOAD=payload DIR:DATADIR=.payload)
+#   ssh -C -o BatchMode=yes -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no host "bash -s <command>" <<< "$payload" || exit $?
+
+
+function waitVM {
+  _printf "{Y}Waiting for node to come online: " 
+  for count in {1..120}
+  do
+        ping_node_ssh quiet
+        _rc=$?
+        if [[ $_rc -eq 0 ]]
+        then
+          _printf " {G}OK\n"
+          return 0
+        else
+          if [[ $_rc -eq 100 ]]
+          then
+            _printf "{R}NOT EXIST\n"
+            exit 100
+          fi
+          _printf "{R}."
+        fi
+        sleep 2
+  done
+  return 1
+}
+
+function dec2hex() {
+local _i=$1
+  case $_i in
+    10)
+       _i="a"
+       ;;
+    11)
+      _i="b"
+       ;;
+    12)
+      _i="c"
+      ;;
+    13)
+      _i="d"
+      ;;
+    14)
+      _i="e"
+      ;;
+    15)
+      _i="f"
+      ;;
+  esac
+  echo -n "$_i"
+}
+
+function random_generator() {
+local _len=$1
+local _count _random _c _i
+  if [[ -z $_len ]]
+  then
+    _len=32
+  else
+    if [[ ! $_len =~ ^[0-9]+$ ]]
+    then
+      _len=32
+    fi
+  fi
+  # always start with letter
+  _i=$(dec2hex $((10 + $(($RANDOM % 6)))))
+  _random="$_i"
+  _count=1
+  while [[ $_count -lt $_len ]]
+  do
+    _i=$(($RANDOM % 16))
+    if [[ $_i -ge 10 ]]
+    then
+      _i=$(dec2hex $_i)
+    fi
+    _random="$_random$_i"
+    ((_count++)) || true
+  done
+  echo -n $_random
+}
+
+function sudo_info() {
+  if ! sudo -n true </dev/null 2>/dev/null
+  then
+    _printf "{M}(please enter your {C}{*}sudo{M} password when prompted)"
+  fi
+}
+
+function do_ssh() {
+local _cmd _payload ip ssh_key quiet=0
+  if [[ $1 == "quiet" ]]
+  then
+    shift
+    quiet=1
+  fi
+  _cmd="$1"
+  _payload="$2"
+	if [[ -f $ME/state/ip ]]
+	then
+		ip=$(<"$ME/state/ip")
+	else
+    if [[ $quiet -eq 1 ]]
+    then
+      return 100
+    fi
+		abort_script "Droplet not created?"
+	fi
+	if [[ -f $ME/state/ssh ]]
+	then
+		ssh_key=$(<"$ME/state/ssh")
+    ssh_key="-i $ssh_key"
+	else
+    if [[ $quiet -eq 1 ]]
+    then
+      return 100
+    fi
+		abort_script "Droplet not created?"
+	fi
+  if [[ -n $_payload ]]
+  then
+    ssh -E /dev/null $ssh_key -C -oLogLevel=ERROR -oBatchMode=yes -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -oConnectTimeout=10 -oConnectionAttempts=1 root@$ip "_XXX_IS_REMOTE=yes $_cmd" <<< "$_payload"
+  else
+    ssh -E /dev/null $ssh_key -C -oLogLevel=ERROR -oBatchMode=yes -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -oConnectTimeout=10 -oConnectionAttempts=1 root@$ip "_XXX_IS_REMOTE=yes $_cmd"
+  fi
+  return $?
+}
+
+function connectSSH() {
+local ip ssh_key
+	if [[ -f $ME/state/ip ]]
+	then
+		ip=$(<"$ME/state/ip")
+	else
+		abort_script "Droplet not created?"
+	fi
+	if [[ -f $ME/state/ssh ]]
+	then
+		ssh_key=$(<"$ME/state/ssh")
+    ssh_key="-i $ssh_key"
+	else
+		abort_script "Droplet not created?"
+	fi
+  ssh="${SSH:-ssh}"
+  if [[ $ssh != "ssh" ]]
+  then
+    # to be safe about diffrent ssh client
+    exec $ssh root@$ip
+  else
+    exec $ssh $ssh_key -oLogLevel=ERROR -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null root@$ip
+  fi
+}
+
+function connectVPN_MOSH() {
+local ip ssh_key
+  if ! command -v mosh >/dev/null 2>&1
+  then
+    abort_script "Local {G}mosh{R} command not found!\n"
+  fi
+	if [[ -f $ME/state/ssh ]]
+	then
+		ssh_key=$(<"$ME/state/ssh")
+	else
+		abort_script "Droplet not created?"
+	fi
+  _printf "{Y}Log in to remote server via {G}MOSH{Y}.\n"
+  if ! vpn-ping 
+  then
+    abort_script "Unable to connect - {G}VPN{R} is not connected!\n"
+  fi
+  exec mosh --ssh="ssh -i $ssh_key -oLogLevel=ERROR -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null" root@$VPN_GATEWAY
+}
+
+function connectVPN_SSH() {
+local ssh_key
+	if [[ -f $ME/state/ssh ]]
+	then
+		ssh_key=$(<"$ME/state/ssh")
+    ssh_key="-i $ssh_key"
+	else
+		abort_script "Droplet not created?"
+	fi
+  exec ssh $ssh_key -oLogLevel=ERROR -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null root@$VPN_GATEWAY
+}
+
+# Check if node is ready to connect
+function ping_node_ssh {
+local _rc
+  if [[ $1 == "quiet" ]]
+  then
+    _rc=0
+    output=$(do_ssh quiet "echo PONG") || _rc=$?
+    if [[ $_rc -ne 0 ]]
+    then
+      return $_rc
+    fi
+  else 
+    output=$(do_ssh "echo PONG") || true
+  fi
+  if [[ $output == "PONG" ]]
+  then
+		return 0
+  fi
+  return 1
+}
+
+# Try to detect system
+function check_system() {
+local _name
+  _name=$(uname -s) 
+  if [[ $? -ne 0 ]]
+  then
+    return 1
+  else
+    if [[ $_name =~ [lL][Ii][nN][uU][xX] ]]
+    then
+      echo "linux"
+      return 0
+    fi
+    if [[ $_name =~ [Dd][aA][rR][wW][iN] ]]
+    then
+      echo "darwin"
+      return 0
+    fi
+    if [[ $_name =~ [Mm][Ii][Nn][Gg][Ww] ]]
+    then
+      echo "windows-mingw"
+      return 0
+    fi
+  fi 
+  return 1
+}
+
+function checkDigiEnv() {
+  _printf "{Y}Preparing enviroment for {G}Digital Ocean{Y} operations.\n"
+  _printf "{Y}Checking env FIRESOCKS_DO_TOKEN for {G}Digital Ocean's{Y} API access: "
+  if [[ -n $FIRESOCKS_DO_TOKEN ]]
+  then
+    _printf "{G}FOUND\n"
+    DIGITALOCEAN_ACCESS_TOKEN="$FIRESOCKS_DO_TOKEN"
+  else
+    _printf "{R}MISSING\n"
+    _printf "\nPlase enter Digital Ocean access tokken? "
+    read _do_token
+    if [[ -z $_do_token ]]
+    then
+      _printf "\n{R}Empty token entered! ... aborting!\n"
+      exit 1
+    fi
+    DIGITALOCEAN_ACCESS_TOKEN=$_do_token
+  fi
+
+  _printf "{Y}Checking {G}Digital Ocean{Y} access token: "
+  export DIGITALOCEAN_ACCESS_TOKEN
+  $ME/tools/${__OS}/doctl compute region list &>/dev/null
+  if [[ $? -ne 0 ]]
+  then
+    _printf "{R}DENIED\n"
+    _printf "{G}Unable to continue!\n"
+    exit 1
+  fi
+  _printf "{G}OK\n"
+}
+
+function createVM() {
+  if [[ -d  $ME/state/droplet ]]
+  then
+    _printf "{G}Dropelet for this instance is already created! {R}ABORTING\n"
+    exit 1
+  fi
+
+  # Checking if there is ssh key present
+
+  if [[ ! -d $HOME/.ssh ]]
+  then
+    mkdir -m 700 "$HOME/.ssh"
+  fi
+  #_printf "{R}WARNING: {Y}if you set password for newly generated key you need to use: {G}ssh-agent\n"
+  _curdate=$(date +%Y-%m-%d)
+  _random=$(random_generator)
+  _ssh_identity="$ME/state/firesocks_sshkey_ed25519_${_curdate}_${_random}"
+  _printf "{Y}Generating new {G}ed25519{Y} ssh key in file {G}%s\n" "$_ssh_identity"
+  ssh-keygen -q -t ed25519 -C "wireguard" -N "" -f "$_ssh_identity"
+  if [[ $? -ne 0 ]]
+  then
+    _printf "{R}Unable to generate new ssh key!\n"
+    exit 1
+  fi
+  _name=$(random_generator)
+  checkDigiEnv
+  if [[ ! -d $ME/state/droplet ]]
+  then
+    mkdir -p -m 700 "$ME/state/droplet"
+  fi
+  sed -e "s#|NAME|#$_name#g" -e "s#|SSH_KEY|#${_ssh_identity}.pub#g" "$ME/template/droplet.tf" >"$ME/state/droplet/vpn.tf"
+  _printf "{Y}Creating new droplet {M}$_name{Y}: "
+ (
+   cd $ME/state/droplet
+   export TF_VAR_DIGITALOCEAN_ACCESS_TOKEN="$DIGITALOCEAN_ACCESS_TOKEN"
+   $ME/tools/${__OS}/terraform init -input=false >../op.log 2>&1
+   _rc=$?
+   $ME/tools/${__OS}/terraform apply -auto-approve -input=false >>../op.log 2>&1
+   if [[ $_rc -ne 0 ]]
+   then
+      exit $_rc
+   fi
+   $ME/tools/${__OS}/terraform output ip >../ip
+ )
+ if [[ $? -ne 0 ]]
+ then
+  _printf "{R}FAILED\n"
+  _printf "Operation log is located here: {G}$ME/state/op.log\n"
+  exit 1
+ fi
+ _printf "{G}DONE\n"
+ echo -n "$_name" >"$ME/state/name"
+ echo -n "$_ssh_identity" >"$ME/state/ssh"
+ ip=$(<"$ME/state/ip")
+ _printf "{Y}Droplet name: {G}$_name{Y} / {R}$ip\n"
+}
+
+function cleanVM() {
+  vpnDOWN
+  sleep 5
+  _printf "Removing droplet: "
+
+  if [[ -d $ME/state/droplet ]]
+  then
+    if [[ -f $ME/state/droplet/terraform.tfstate ]]
+    then
+      checkDigiEnv
+      (
+        cd $ME/state/droplet
+        export TF_VAR_DIGITALOCEAN_ACCESS_TOKEN="$DIGITALOCEAN_ACCESS_TOKEN"
+        $ME/tools/${__OS}/terraform destroy -input=false -auto-approve >>../op.log 2>&1
+      )
+      if [[ $? -eq 0 ]]
+      then
+        _printf "Droplet was removed!\n"
+      else
+        _printf "{R}Unable to remove droplet!\n"
+        exit 1
+      fi
+    fi
+  fi
+  if [[ -d $ME/state/droplet ]]
+  then
+    rm -rf  $ME/state/droplet
+  fi
+  if [[ -f $ME/state/ssh ]]
+  then
+    key=$(<$ME/state/ssh)
+    if [[ -f $key ]]
+    then
+      rm -f $key
+    fi
+    if [[ -f ${key}.pub ]]
+    then 
+      rm -f ${key}.pub
+    fi
+    rm -f "$ME/state/ssh"
+  fi
+  if [[ -f $ME/state/ip ]]
+  then
+    rm -f "$ME/state/ip"
+  fi
+  if [[ -f $ME/state/name ]]
+  then
+    rm -f "$ME/state/name"
+  fi
+  if [[ -f $ME/state/wg ]]
+  then
+    rm -f "$ME/state/wg"
+  fi
+  if [[ -f $ME/state/wg-quick ]]
+  then
+    rm -f "$ME/state/wg-quick"
+  fi
+  if [[ -f $ME/state/wg-internal ]]
+  then
+    rm -f "$ME/state/wg-internal"
+  fi
+  if [[ -f $ME/state/vpn ]]
+  then
+    rm -f "$ME/state/vpn"
+  fi
+  if [[ -f $ME/state/vpn.conf ]]
+  then
+    rm -f "$ME/state/vpn.conf"
+  fi
+  if [[ -f $ME/state/vpn.connected ]]
+  then
+    rm -f "$ME/state/vpn.connected"
+  fi
+  if [[ -f $ME/state/detected ]]
+  then
+    rm -f "$ME/state/detected"
+  fi
+  cd "$ME/state"
+  rm -f user* 1>/dev/null 2>&1
+  _printf "{G}DONE\n"
+}
+
+function pingVM() {
+  if [[ $1 == "quiet" ]]
+  then
+  	ping_node_ssh quiet
+    return $?
+  else
+  	_printf "{M}Checking droplet status: "
+  	ping_node_ssh 
+  	if [[ $? -eq 1 ]]
+  	then
+  		_printf "{R}DOWN\n"
+  		exit 1
+  	fi
+  	_printf "{G}ALIVE\n"
+  fi
+}
+
+function bootstrapVM() {
+	ping_node_ssh 
+  if [[ $? -ne 0 ]]
+  then
+    abort_script "Droplet is not ready!\n"
+  fi
+  payload=$(prepareRemotePayload $0 DIR:SCRIPT=script DIR:CONFIG=remote)
+  do_ssh "bash -s prepare-node" "$payload"
+  ensure_custom_packages
+}
+
+function firewallVM() {
+	ping_node_ssh 
+  if [[ $? -ne 0 ]]
+  then
+    abort_script "Droplet is not ready!\n"
+  fi
+  _printf "Setting up host {Y}firewall{N}: "
+  payload=$(prepareRemotePayload $0)
+  do_ssh "bash -s firewall" "$payload"
+  if [[ $? -eq 0 ]]
+  then
+    _printf "{G}OK\n"
+  else
+    abort_script "FAIL\n"
+  fi
+}
+
+function rebootVM() {
+	ping_node_ssh 
+  if [[ $? -ne 0 ]]
+  then
+    abort_script "Droplet is not ready!\n"
+  fi
+  _printf "{R}Rebooting the droplet!\n"
+  payload=$(prepareRemotePayload $0)
+  do_ssh "bash -s reboot" "$payload"
+}
+
+function setupVPN() {
+local ip
+	if [[ -f $ME/state/ip ]]
+	then
+		ip=$(<"$ME/state/ip")
+	else
+		abort_script "Droplet not created?"
+	fi
+	ping_node_ssh 
+  if [[ $? -ne 0 ]]
+  then
+    abort_script "Droplet is not ready!\n"
+  fi
+  payload=$(prepareRemotePayload $0)
+  do_ssh "bash -s setup-vpn $ip $VPN_ADDRESS_POOL $VPN_GATEWAY" "$payload"
+}
+
+function setupWGClient() {
+	ping_node_ssh 
+  if [[ $? -ne 0 ]]
+  then
+    abort_script "Droplet is not ready!\n"
+  fi
+  payload=$(prepareRemotePayload $0)
+  conf=$(do_ssh "bash -s setup-user" "$payload")
+  if [[ $? -ne 0 ]]
+  then
+    abort_script "Unable to configure {G}VPN{R} connection!\n"
+  fi
+  echo -n "$conf" >"$ME/state/vpn"
+  echo -n "$conf" | base64 -d >"$ME/state/vpn.conf"
+}
+
+function addUser() {
+  if [[ ! $1 =~ ^[0-9]+$ ]]
+  then
+    abort_script "User number required!\n"
+  fi
+  shopt -s extglob
+  user_no=${1##+(0)}
+  shopt -u extglob
+  if [[ -f $ME/state/user${user_no} ]]
+  then
+    abort_script "User number ${user_no} already exists!\n"
+  fi
+	ping_node_ssh 
+  if [[ $? -ne 0 ]]
+  then
+    abort_script "Droplet is not ready!\n"
+  fi
+  payload=$(prepareRemotePayload $0)
+  conf=$(do_ssh "bash -s add-user $user_no" "$payload")
+  if [[ $? -ne 0 ]]
+  then
+    abort_script "Unable to configure {G}VPN{R} connection!\n"
+  fi
+  echo -n "$conf" >"$ME/state/user${user_no}"
+  echo -n "$conf" | base64 -d >"$ME/state/user${user_no}.conf"
+}
+
+function showUser() {
+  if [[ ! $1 =~ ^[0-9]+$ ]]
+  then
+    abort_script "User number required!\n"
+  fi
+  shopt -s extglob
+  user_no=${1##+(0)}
+  shopt -u extglob
+  if [[ -f $ME/state/user${user_no} ]]
+  then
+    cat "$ME/state/user${user_no}" | base64 -d
+  else
+    abort_script "User number ${user_no} do not exist!\n"
+  fi
+}
+
+function qrcodeUser() {
+  if [[ ! $1 =~ ^[0-9]+$ ]]
+  then
+    abort_script "User number required!\n"
+  fi
+  shopt -s extglob
+  user_no=${1##+(0)}
+  shopt -u extglob
+  if [[ -f $ME/state/user${user_no}.conf ]]
+  then
+    clear
+    cat <<< $("$ME/tools/${__OS}/qrterminal" -q 0  $(<"$ME/state/user${user_no}.conf") | sed "s/^/    /")
+  else
+    abort_script "User number ${user_no} do not exist!\n"
+  fi
+}
+
+
+
+
+function VM() {
+  # At this moment  we have working API access to digital
+  case "$1" in
+    create|c|new)
+      createVM "$@"
+      ;;
+    clean|delete|remove|destroy|del|rm)
+      cleanVM "$@"
+      ;;
+    ping)
+      shift
+      pingVM "$@"
+      ;;
+    wait)
+      waitVM "$@"
+      ;;
+    ssh)
+      connectSSH
+      ;;
+    bootstrap)
+      bootstrapVM "@"
+      ;;
+    firewall)
+      firewallVM "@"
+      ;;
+    reboot)
+      rebootVM "@"
+     ;;
+    *)
+      _printf "{Y}Unknow command: {G}firesocks vm create|destroy|ping|ssh|bootstrap|firewall|reboot\n"
+      exit 1
+  esac
+}
+
+function installHomebrew_mac_menu() {
+  clear
+  _printf "\n\n\t{G}Homebrew {Y}is required for {G}WireGuard {Y}installation.\n"
+  _printf "\n\t{Y}Do you want to install {G}Homebrew {M}https://brew.sh/{Y}?\n"
+  _printf "\n\n\t\t{Y}Please select {G}Yes{Y} or {G}No{Y}?\n\n"
+  _printf "\n\n\t\t\t1. {G}YES\n"
+  _printf "\n\t\t\t2. {Y}NO\n"
+  _printf "\n\n\t\t\t{R}Please enter 1 or 2? "
+}
+
+function installHomebrew_mac() {
+local _ans=""
+  while [[ $_ans != "1" ]] &&  [[ $_ans != "2" ]]
+  do
+    installHomebrew_mac_menu
+    read -s -n 1 _ans
+  done
+  clear
+  if [[ $_ans == "2" ]]
+  then
+    _printf "\n\n\tYou selected {R}NO{N}. I can not continue...\n\n"
+    exit 0
+  fi
+  _printf "\n\n{Y}Installing {G}Homebrew{Y} (please enter your password when prompted)!\n\n"
+  /usr/bin/ruby -e "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install)"
+}
+
+function installWGClinet_mac() {
+  if [[ ! -f $ME/state/wg ]]
+  then
+    if [[ $1 == "external" ]]
+    then
+      if ! command -v brew >/dev/null 2>&1
+      then
+        installHomebrew_mac
+      fi
+      if ! command -v wg >/dev/null 2>&1
+      then
+        _printf "{Y}Installaling {G}wireguard-tools\n"
+        brew list wireguard-tools 1>/dev/null 2>&1 || brew install wireguard-tools
+        echo -n "$(command -v wg)" >"$ME/state/wg"
+        echo -n "$(command -v wg-quick)" >"$ME/state/wg-quick"
+        if [[ -f $ME/state/wg-internal ]]
+        then
+          rm -f "$ME/state/wg-internal"
+        fi
+      fi
+    else
+      touch "$ME/state/wg-internal"
+      echo -n "$ME/tools/drawin/wg" >"$ME/state/wg"
+      echo -n "$ME/tools/drawin/wg-quick" >"$ME/state/wg-quick"
+    fi
+  fi
+}
+
+function installWGClient_ubuntu() {
+  _printf "{Y}Installing WireGuard on {G}Ubuntu{Y} (please enter your password when prompted)!\n"
+  if [[ ${__OS_VERSION} -lt 1910 ]]
+  then
+    _printf "{Y}Adding extra wireguard repository {G}ppa:wireguard/wireguard\n"
+    sudo add-apt-repository -n -y ppa:wireguard/wireguard  >>"$ME/state/op.log" 2>&1
+  fi
+  _printf "{Y}Updateing package database.\n"
+  sudo apt-get update -qq
+  _printf "{Y}Installing {G}WireGuard\n"
+  sudo apt-get install wireguard resolvconf -qq >>"$ME/state/op.log" 2>&1
+}
+
+function installWGClient_fedora() {
+  _printf "{Y}Installing WireGuard on {G}Fedora{Y} (please enter your password when prompted)!\n"
+  if [[ ${__OS_VERSION} -lt 32 ]]
+  then
+    _printf "{Y}Adding extra wireguard repository {G}\n"
+    sudo dnf copr -y enable jdoss/wireguard
+    _printf "{Y}Installing {G}WireGuard\n"
+    sudo dnf install -y wireguard-dkms wireguard-tools >>"$ME/state/op.log" 2>&1
+  else
+    _printf "{Y}Installing {G}WireGuard\n"
+    sudo dnf install wireguard-tools >>"$ME/state/op.log" 2>&1
+  fi
+}
+
+function installWGClient_linux() {
+  if ! command -v wg >/dev/null 2>&1
+  then
+    if [[ ${__OS_ID} == "ubuntu" ]]
+    then
+      installWGClient_ubuntu
+    fi
+    if [[ ${__OS_ID} == "fedora" ]]
+    then
+      installWGClient_fedora
+    fi
+  fi
+  if command -v wg >/dev/null 2>&1 && command -v wg-quick >/dev/null 2>&1
+  then
+    echo -n "$(command -v wg)" >"$ME/state/wg"
+    echo -n "$(command -v wg-quick)" >"$ME/state/wg-quick"
+  else
+    
+    abort_script "Unsuported Linux distribution!"
+  fi
+}
+  
+function installWGClient() {
+  if [[ ${__OS} == "darwin" ]]
+  then
+    installWGClinet_mac "$@"
+    return $?
+  fi
+  if [[ ${__OS} == "linux" ]]
+  then
+    installWGClient_linux "$@"
+    return $?
+  fi
+  abort_script "Unable to install wiregruad client!\n"
+}
+
+function vpnUP() {
+  if [[ ! -f $ME/state/vpn ]]
+  then
+    _printf "{R}VPN not configured!\n"
+    return 1
+  fi
+  if [[ $__OS == "darwin" ]] && [[ -f $ME/state/wg-internal ]]
+  then
+    export PATH="$ME/tools/darwin:$PATH"
+  fi
+  _printf "{Y}Connecting to {G}VPN{Y}. "
+  sudo_info
+  _printf "\n"
+  sudo wg-quick up "$ME/state/vpn.conf" >>"$ME/state/op.log" 2>&1
+  if [[ $? -eq 0 ]]
+  then
+    _printf "{Y}Connection: {G}successful\n"
+    touch "$ME/state/vpn.connected"
+  else
+    if [[ -f $ME/state/vpn.connected ]] && vpn-ping 
+    then
+      _printf "{Y}Already {G}connected{Y}.\n"
+    else
+      _printf "{Y}Connection: {R}failed{Y}\n"
+    fi
+  fi
+}
+function vpnDOWN() {
+  if [[ ! -f $ME/state/vpn ]]
+  then
+    _printf "{R}VPN not configured!\n"
+    return 1
+  fi
+  if [[ $__OS == "darwin" ]] && [[ -f $ME/state/wg-internal ]]
+  then
+    export PATH="$ME/tools/darwin:$PATH"
+  fi
+  if [[ ! -f $ME/state/vpn.connected ]]
+  then
+    _printf "{R}VPN not connected.\n"
+    return 1
+  fi
+  _printf "{Y}Shutting down {G}VPN{Y}. "
+  sudo_info
+  _printf "\n"
+  sudo wg-quick down "$ME/state/vpn.conf" >>"$ME/state/op.log" 2>&1
+  if [[ $? -eq 0 ]]
+  then
+    _printf "{Y}Connection: {R}terminated\n"
+    if [[ -f $ME/state/vpn.connected ]]
+    then
+      rm -f $ME/state/vpn.connected
+    fi
+  else
+    if ! vpn-ping
+    then
+      _printf "{Y}Connection: {R}terminated\n"
+      if [[ -f $ME/state/vpn.connected ]]
+      then
+        rm -f $ME/state/vpn.connected
+      fi
+    else
+      _printf "{Y}Unable to {R}terminate {G}VPN {R} connection!\n"
+    fi
+  fi
+}
+
+function vpn-ping() {
+  ping -n -c 1 "$VPN_GATEWAY" >/dev/null 2>&1
+}
+
+function showVpnPing() {
+  _printf "{Y}VPN connection status: "
+  vpn-ping
+  if [[ $? -eq 0 ]]
+  then
+    _printf "{G}CONNECTED\n"
+  else
+    _printf "{R}NOT CONNECTED\n"
+  fi
+}
+
+function VPN() {
+  # At this moment  we have working API access to digital
+  case "$1" in
+    server)
+      shift
+      case "$1" in
+        setup)
+          setupVPN "$@"
+          ;;
+        *)
+          _printf "{Y}Unknow command: {G}firesocks vpn server setup\n"
+          exit 1
+      esac
+      ;;
+    client)
+      shift
+      case "$1" in
+        install)
+          shift
+          installWGClient "$@"
+          ;;
+        setup)
+          shift
+          setupWGClient "$@"
+          ;;
+        *)
+          _printf "{Y}Unknow command: {G}firesocks vpn client install|setup\n"
+          exit 1
+      esac
+      ;;
+     user)
+        shift
+        case "$1" in
+          add)
+            shift
+            addUser "$1"
+            ;;
+          show)
+            shift
+            showUser "$1"
+            ;;
+          qrcode)
+            shift
+            qrcodeUser "$1"
+            ;;
+         esac
+        ;;
+     up)
+      vpnUP "$@"
+      ;;
+   down)
+      vpnDOWN "$@"
+      ;;
+  ping)
+      showVpnPing "$@"
+      ;;
+  mosh)
+      connectVPN_MOSH
+      ;;
+  ssh)
+      connectVPN_SSH
+      ;;
+     *)
+      _printf "{Y}Unknow command: {G}firesocks vpn ssh|mosh|server|client|up|down|user add|show|qrcode\n"
+      exit 1
+  esac
+}
+
+# Make sure all required tools are executable
+# Git sometimes lose this info
+function prepareTools() {
+local _tool
+  for _tool in doctl terraform wg wg-quick qrterminal
+  do
+    if [[ -f $ME/tools/${__OS}/${_tool}.gz ]] && [[ ! -f $ME/tools/${__OS}/${_tool} ]]
+    then
+      _printf "{M}Decompressing ${_tool}: "
+      gzip -d -k $ME/tools/${__OS}/${_tool}.gz
+      _printf "{G}OK\n"
+    fi
+    if [[ -f $ME/tools/${__OS}/$_tool ]]
+    then
+      if [[ ! -x $ME/tools/${__OS}/$_tool ]]
+      then
+        _printf "{Y}Fixing permision for {B}$_tool\n"
+        chmod +x $ME/tools/${__OS}/$_tool
+      fi
+    fi
+ done
+}
+
+# check if all required commands are availible
+function checkCommands() {
+  if ! command -v ssh &>/dev/null
+  then
+    _printf "{G}Unable to continue: {R}ssh{G} command is missing!\n"
+    exit 1
+  fi
+  if ! command -v ssh-keygen &>/dev/null
+  then
+    _printf "{G}Unable to continue: {R}ssh-keygen{G} command is missing!\n"
+    exit 1
+  fi
+  if ! command -v base64 &>/dev/null
+  then
+    _printf "{G}Unable to continue: {R}base64{G} command is missing!\n"
+    exit 1
+  fi
+  if ! command -v tar &>/dev/null
+  then
+    _printf "{G}Unable to continue: {R}tar{G} command is missing!\n"
+    exit 1
+  fi
+  if ! command -v gzip &>/dev/null
+  then
+    _printf "{G}Unable to continue: {R}gzip{G} command is missing!\n"
+    exit 1
+  fi
+}
+
+function remote_update() {
+  if [[ $REMOTE_NEEDS_UPDATE -ne 0 ]]
+  then
+    _printf "Updating {Y}packages{N}: "
+    apt-get -qq update
+    _printf "{G}OK\n"
+    REMOTE_NEEDS_UPDATE=0
+  fi
+}
+
+function remote_update_and_upgrade() {
+local _log
+  _log="$(getRemotePayloadDir)/op.log"
+  remote_update
+  _printf "Upgrading {Y}system{N}: "
+  DEBIAN_FRONTEND=noninteractive apt-get -qq dist-upgrade >>$_log 2>&1
+  if [[ $? -ne 0 ]]
+  then
+      _printf "{R}FAILED\n"
+      return 1
+  fi
+  _printf "{G}OK\n"
+  return 0
+}
+
+# Install a package if it isn't already installed
+function remote_ensure_package() {
+local _log
+  _log="$(getRemotePayloadDir)/op.log"
+  remote_update
+  for pkg in $@
+  do
+    _printf  "Installing {Y}$pkg{N}: "
+    if ! dpkg -l "$pkg" 2>/dev/null | grep -q ^ii
+    then
+      DEBIAN_FRONTEND=noninteractive apt-get install -qq "$pkg" >>$_log 2>&1
+      if [[ $? -ne 0 ]]
+      then
+        _printf "{R}FAILED\n"
+        return 1
+      fi
+    fi
+    _printf "{G}OK\n"
+  done
+  return 0
+}
+
+function remote_setup_vpn() {
+local _log
+  _log="$(getRemotePayloadDir)/op.log"
+  if [[ ! -d $HOME/.config/wg_simple ]]
+  then
+    if [[ ! -x $HOME/script/wg_simple ]]
+    then
+      abort_script "This node is not ready! Run: {G}firesocks vm bootstrap\n"
+    fi
+    _printf "{Y}Creating {R}VPN{Y} address pool: "
+    $HOME/script/wg_simple ip set "$2"
+    $HOME/script/wg_simple dns "$3"
+    _printf "{G}$2\n"
+    _printf "{Y}Creating {R}VPN{Y} endpoint for: "
+    $HOME/script/wg_simple setup "$1"
+    _printf "{G}$1\n"
+    _printf "{Y}VPN gateway address: {G}$3\n"
+  else
+    _printf "{Y}Node already configured!\n"
+  fi
+  if [[ ! -d $HOME/remote/pihole ]]
+  then
+    abort_script "Bootstrap your server first!\n"
+  fi
+  if [[ ! -f $HOME/remote/pihole/.ready ]]
+  then
+    _printf "{Y}Setting up {G}Pi-Hole{Y} DNS server: "
+    sed -i -e "s#|VPN_GATEWAY|#$3#g" -e "s#|VPN_POOL|#$2#g" "$HOME/remote/pihole/unbound/unbound.conf" "$HOME/remote/pihole/docker-compose.yml"
+    _printf "{G}OK\n"
+    cd "$HOME/remote/pihole"
+    _printf "{Y}Preparing {G}Pi-Hole{Y} DNS server: "
+    docker-compose pull -q >>$_log 2>&1
+    docker-compose build -q >>$_log 2>&1
+    _printf "{G}OK\n"
+    _printf "{Y}Starting {G}Pi-Hole{Y} DNS server: "
+    docker-compose up -d >>$_log 2>&1
+    _printf "{G}OK\n"
+    touch $HOME/remote/pihole/.ready
+  fi
+} 
+
+function remote_setup_user() {
+  set -e
+  if [[ ! -d $HOME/.config/wg_simple ]]
+  then
+    exit 1
+  fi
+  if ! usr=$($HOME/script/wg_simple show remote 2>/dev/null)
+  then
+    $HOME/script/wg_simple add remote
+  fi
+  $HOME/script/wg_simple show remote 2>/dev/null | base64 -w 0
+} 
+
+function remote_setup_new_user() {
+  set -e
+  if [[ ! -d $HOME/.config/wg_simple ]]
+  then
+    exit 1
+  fi
+  if [[ ! $1 =~ ^[0-9]+$ ]]
+  then
+    abort_script "Security error!\n"
+  fi
+  if ! usr=$($HOME/script/wg_simple show user$1 2>/dev/null)
+  then
+    $HOME/script/wg_simple add user$1
+  fi
+  $HOME/script/wg_simple show user$1 2>/dev/null | base64 -w 0
+} 
+
+
+
+function ensure_custom_packages() {
+  _printf "Checking for {G}extra.packages{Y} file: "
+  if [[ -f $ME/extra.packages ]]
+  then
+    _printf "{G}PRESENT\n"
+    pkgs=""
+    while read pkg
+    do
+      if [[ $pkg =~ ^# ]]
+      then
+        continue
+      fi
+      if [[ -n $pkg ]]
+      then
+        pkgs="$pkgs $pkg"
+      fi
+    done < "$ME/extra.packages"
+    if [[ -n $pkgs ]]
+    then
+      _printf "Installing extra packages: $pkgs\n"
+      payload=$(prepareRemotePayload $0)
+      do_ssh "bash -s extra-packages $pkgs" "$payload"
+    else
+      _printf "No extra packages to install\n"
+    fi
+  else
+    _printf "{G}ABSENT\n"
+  fi
+}
+
+function remote_install_docker() {
+local _log
+  _log="$(getRemotePayloadDir)/op.log"
+  _printf  "Installing {Y}docker{N}: "
+  if ! command -v docker >/dev/null 2>&1
+  then
+    curl -fsSL https://get.docker.com | sh >>$_log 2>&1
+  fi
+  _printf "{G}OK\n"
+}
+
+function remote_install_docker_composer() {
+local _log
+  _log="$(getRemotePayloadDir)/op.log"
+  _printf  "Installing {Y}docker-compose{N}: "
+  if ! command -v docker-compose >/dev/null 2>&1
+  then
+    curl -s -L https://github.com/docker/compose/releases/download/1.25.1/docker-compose-`uname -s`-`uname -m` -o /usr/local/bin/docker-compose
+    chmod +x /usr/local/bin/docker-compose 
+  fi
+  _printf "{G}OK\n"
+}
+
+function remote_firewall() {
+  _log="$(getRemotePayloadDir)/op.log"
+  ufw allow proto tcp from any to any port 22 >>$_log 2>&1
+  ufw allow proto udp from any to any port 51820 >>$_log 2>&1
+  ufw allow in on vpn >>$_log 2>&1
+  ufw --force enable >>$_log 2>&1
+}
+
+function remote_wireguard_install() {
+  _log="$(getRemotePayloadDir)/op.log"
+  _printf  "Installing {Y}wireguard{N}: "
+  apt-get install wireguard -qq >>$_log 2>&1
+  _printf "{G}OK\n"
+}
+
+function remote_wireguard_setup() {
+  _log="$(getRemotePayloadDir)/op.log"
+  _printf  "Preparing {Y}wireguard{N}: "
+  add-apt-repository -y -n ppa:wireguard/wireguard >>$_log 2>&1
+  _printf "{G}OK\n"
+}
+
+function remote_prepare_node() {
+  remote_wireguard_setup
+  remote_update_and_upgrade
+  if [[ $? -ne 0 ]]
+  then
+    abort_script "Step failed! aborting! {G}You can safely try again!"
+  fi
+  remote_ensure_package haveged dnsutils curl mosh
+  if [[ $? -ne 0 ]]
+  then
+    abort_script "Step failed! aborting! {G}You can safely try again!"
+  fi
+  remote_install_docker
+  remote_install_docker_composer
+  remote_wireguard_install
+  _printf "Installing {Y}wg_simple{N}: "
+  payload=$(getRemotePayload DIR:SCRIPT $HOME)
+  chmod +x "$payload/script/wg_simple"
+  payload=$(getRemotePayload DIR:CONFIG $HOME)
+  _printf "{G}OK\n"
+}
+
+# This function reboot remote node - but allow to return correct return code
+# Also it doesn't block conniection via ssh
+function remote_special_reboot() {
+  # To make sure no connection via ssh is allowed to next start
+  systemctl stop ssh
+  # Create new session
+  setsid bash -c "sleep 3;reboot -f" </dev/null &>/dev/null&
+  # Detach from current shell session
+  disown
+}
+
+function detect_linux_distro() {
+  # only new distros supported
+  if [[ ! -f /etc/os-release ]]
+  then
+    abort_script "Unable to determine Linux distribution!\n"
+  fi
+  # don't overwrite the env
+  info=$( (
+      source /etc/os-release
+      set -e
+      [[ -n $ID ]] 
+      [[ -n $VERSION_ID ]]
+      echo $ID:$VERSION_ID
+     ) )
+  if [[ $? -ne 0 ]]
+  then
+    abort_script "Unable to determine Linux distribution!\n"
+  fi
+  __OS_ID="$(echo -n ${info%%:*} | tr A-Z a-z)"
+  __OS_VERSION="${info##*:}"
+  if [[ $__OS_VERSION =~ \. ]]
+  then
+    __OS_VERSION="${__OS_VERSION//./}"
+  fi
+  if [[ ! ${__OS_VERSION} =~ ^[0-9]+$ ]]
+  then
+    abort_script "Unable to determine distribution version!\n"
+  fi
+}
+
+function fullStart() {
+  if [[ -f $ME/state/vpn ]]
+  then
+    abort_script "This system is already configured!\n"
+  fi
+  VM create
+  VM wait
+  VM firewall
+  VM bootstrap
+  VM reboot
+  VM wait
+  VM ping
+  VPN server setup
+  VPN client install
+  VPN client setup
+  VPN up
+  _printf "\nConnection established.\n"
+  _printf "Pi-Hole admin URL:  {G}http://admin.pi-hole/admin\n"
+  _printf "Admin password: {G}pihole\n"
+  _printf "\nTry first: {G}ping -c 1 admin.pi-hole\n"
+  _printf "\nConnecting to the droplet:\n"
+  _printf "\t{Y}Via public address: {G}./firesocks vm ssh\n"
+  _printf "\t{Y}Via vpn address: {G}./firesocks vpn ssh{Y} or {G}./firesocks vpn mosh\n"
+  _printf "\n"
+}
+
+function showDarwin() {
+_printf "{G}{N}"
+cat <<'EOF'
+___  ___           _____ _____  __   __
+|  \/  |          |  _  /  ___| \ \ / /
+| .  . | __ _  ___| | | \ `--.   \ V / 
+| |\/| |/ _` |/ __| | | |`--. \  /   \ 
+| |  | | (_| | (__\ \_/ /\__/ / / /^\ \
+\_|  |_/\__,_|\___|\___/\____/  \/   \/
+EOF
+_printf "\n"
+}
+function showLinux() {
+_printf "{G}{N}"
+cat <<'EOF'
+██╗     ██╗███╗   ██╗██╗   ██╗██╗  ██╗
+██║     ██║████╗  ██║██║   ██║╚██╗██╔╝
+██║     ██║██╔██╗ ██║██║   ██║ ╚███╔╝ 
+██║     ██║██║╚██╗██║██║   ██║ ██╔██╗ 
+███████╗██║██║ ╚████║╚██████╔╝██╔╝ ██╗
+╚══════╝╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═╝
+EOF
+_printf "\n"
+}
+
+__OS=$(check_system)
+if [[ $? -ne 0 ]]
+then
+  _errorbox 60 "Unknow OS - not supported!"
+  exit 1
+fi
+
+if [[ ${__OS} == "windows-mingw" ]]
+then
+  _errorbox 60 "Windows BASH not supported!"
+  exit 1
+fi
+
+if [[ ${__OS} == "linux" ]]
+then
+  detect_linux_distro
+fi
+if [[ $_XXX_IS_REMOTE != "yes" ]]
+then
+  if [[ ! -d $ME/state ]]
+  then
+    mkdir -p -m 700 "$ME/state" 
+  fi
+
+  if [[ ! -f $ME/state/detected ]]
+  then
+    if [[ ${__OS} == "darwin" ]]
+    then
+      showDarwin
+    elif [[ ${__OS} == "linux" ]]
+    then
+      showLinux
+    else
+      _printbox 80 "Dectected system: ${__OS}"
+    fi
+    touch "$ME/state/detected"
+  fi
+
+  prepareTools
+  checkCommands
+
+  case "$1" in
+    vm)
+      shift
+      VM "$@"
+      ;;
+    vpn)
+      shift
+      VPN "$@"
+      ;;
+    start)
+      fullStart
+      ;;
+    stop)
+      VM destroy
+      ;;
+    *)
+      _printf "{Y}Supporeted commands: {G}firesocks vm|vpn|start|stop\n"
+      exit 1
+      ;;
+  esac
+else
+  # This is remote part 
+  case "$1" in
+    prepare-node)
+      shift
+      remote_prepare_node
+      ;;
+    extra-packages)
+      shift
+      remote_ensure_package "$@"
+      ;;
+    firewall)
+      shift
+      remote_firewall "$@"
+      ;;
+    reboot)
+      shift
+       remote_special_reboot
+       ;;
+    setup-vpn)
+      shift
+      remote_setup_vpn "$@"
+        ;;
+    setup-user)
+      shift
+      remote_setup_user "$@"
+      ;;
+    add-user)
+      shift
+      remote_setup_new_user "$@"
+      ;;
+  esac
+fi
+# vim: set tabstop=2 shiftwidth=2 expandtab autoindent indentexpr= nosmartindent background=dark :

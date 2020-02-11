@@ -1,0 +1,44 @@
+version: "3"
+services:
+  pihole:
+    container_name: pihole
+    image: pihole/pihole:latest
+    ports:
+      - "|VPN_GATEWAY|:53:53/tcp"
+      - "|VPN_GATEWAY|:53:53/udp"
+      - "|VPN_GATEWAY|:80:80/tcp"
+      - "|VPN_GATEWAY|:443:443/tcp"
+    environment:
+      TZ: 'America/Chicago'
+      DNS1: 198.51.100.100
+      DNS2: 'no'
+      WEBPASSWORD: pihole
+      VIRTUAL_HOST: admin.pi-hole
+    volumes:
+      - pihole:/etc/pihole/
+      - dnsmasq:/etc/dnsmasq.d/
+    restart: unless-stopped
+    networks:
+      dns:
+        ipv4_address: 198.51.100.200
+
+  unbound:
+    container_name: unbound
+    image: local/unbound
+    build: unbound
+    restart: unless-stopped
+    networks:
+      dns:
+        ipv4_address: 198.51.100.100
+
+networks:
+  dns:
+    driver: bridge
+    ipam:
+     config:
+       # This is TEST-NET-2 see https://tools.ietf.org/html/rfc5737
+       - subnet: 198.51.100.0/24
+
+volumes:
+    pihole:
+    dnsmasq:
