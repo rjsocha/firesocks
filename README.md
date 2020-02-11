@@ -26,7 +26,8 @@ Not finised requirements:
 
 Tech used: Linux, MacOS X, WireGuard, docker, docker-compose, terraform, ssh, pi-hole,unbound, qrterminal, Windows, powershell.
 
-Demo of functionality.
+Demo:
+
 [<img src="https://asciinema.org/a/300286.png" width=500 height=333>](https://asciinema.org/a/300286)
 
 You can put Digital API access token in env var:
