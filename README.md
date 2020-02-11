@@ -19,7 +19,7 @@ Requiremets of the customer:
 13. Create additional users.
 14. Generate qrcode for mobile devices (with Wireguard configuration).
 
-Not finised requirements:
+Not finished requirements:
 1. Display web page when domain is blocked.
 2. Windows part (only stub functionality was writen).
 3. Monitor VPN connection and terminate it after specified time.
