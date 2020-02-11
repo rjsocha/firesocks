@@ -2,6 +2,8 @@
 
 This is unpaid job from one of the freelancer-like sites. This about 18 hours of work. I don't know if this too much for such project.
 
+From my side: all my code is public domain.
+
 Requiremets of the customer:
 1. All should work from console/terminal.
 2. Output should be in colors.
