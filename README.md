@@ -1,6 +1,6 @@
 # Firesocks - Pi-Hole ad-blocker via WireGuard.
 
-This is unpaid job from one of the freelancer-like sites. This about 18 hours of work. I don't know if this too much for such project.
+This is an unpaid job from one of the freelancer-like site. This about 18 hours of work. I don't know if this too much for such project.
 
 From my side: all my code is public domain.
 
